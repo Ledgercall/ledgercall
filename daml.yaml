@@ -1,0 +1,25 @@
+# LEDGERCALL — Daml project
+#
+# Version pin (spec §6.2 / §6.3): the 3.5.x line targets Daml-LF 2.2 and Canton
+# protocol v35, which is what DevNet/TestNet/LocalNet run (MainNet Canton 3.5.17,
+# TestNet 3.5.18). 3.5.12 is the current latest and is deploy-compatible with all
+# of them. The exact SDK is reconciled with the cn-quickstart LocalNet in Phase B.
+sdk-version: 3.5.12
+name: ledgercall
+version: 1.0.0
+source: daml
+# IMPORTANT (spec §6.3): since Canton 3.5.1 ledger queries MUST use the
+# package-NAME form `#ledgercall:LedgerCall.Module:Template`, never a hex pkg id.
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+# Real Canton Network Token Standard (CIP-0056) interface DARs, built from
+# github.com/canton-network/splice token-standard/ — see scripts/build-token-standard.sh.
+# Our venue code (LedgerCall.Allocation / .Settlement) depends ONLY on these
+# standard interfaces — zero registry-specific imports (spec §7.4, §7.5).
+data-dependencies:
+  - .lib/splice-api-token-metadata-v1-1.0.0.dar
+  - .lib/splice-api-token-holding-v1-1.0.0.dar
+  - .lib/splice-api-token-allocation-v1-1.0.0.dar
+  - .lib/splice-api-token-allocation-request-v1-1.0.0.dar

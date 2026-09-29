@@ -1,0 +1,25 @@
+# Daml build output
+.daml/
+*.dar.log
+
+# Node / Vite (frontend, added in Phase B)
+node_modules/
+frontend/dist/
+frontend/node_modules/
+*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs / scratch
+*.log
+/tmp/
+
+# Generated per-seed by scripts/gen-frontend-config.sh (run-specific party IDs + dev token)
+frontend/public/demo-config.json
+
+# NOTE: the four token-standard interface DARs under .lib/ ARE committed on purpose
+# so the project builds out of the box. Regenerate them with scripts/build-token-standard.sh.
