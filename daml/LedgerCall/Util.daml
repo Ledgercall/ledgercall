@@ -1,0 +1,45 @@
+-- | Money arithmetic and the exact pro-rata split.
+--
+-- Money is handled in integer cents so rounded shares sum back to the exact total.
+-- Residual cents are assigned by the largest-remainder (Hamilton) method, ties broken
+-- by commitment size then party for determinism.
+module LedgerCall.Util where
+
+import DA.List (sortOn)
+
+-- | Round a Decimal amount to whole cents.
+centsOf : Decimal -> Int
+centsOf x = round (x * 100.0)
+
+-- | Convert integer cents back to a 2dp Decimal amount.
+dollarsOf : Int -> Decimal
+dollarsOf n = intToDecimal n / 100.0
+
+-- | Exact pro-rata split of `total` across `(party, weight)` pairs.
+--
+-- Returns `(party, amountDue)` such that `sum amountDue == total` exactly
+-- (to the cent). Weights are the LPs' commitments. Empty / zero-weight input
+-- yields an empty split.
+proRata : Decimal -> [(Party, Decimal)] -> [(Party, Decimal)]
+proRata total commits =
+  let totalWeight = sum (map snd commits)
+      totalCents  = centsOf total
+  in if totalWeight <= 0.0 || null commits
+       then []
+       else
+         let -- floored cent share plus the fractional remainder, per LP
+             raw =
+               [ let exact = intToDecimal totalCents * c / totalWeight
+                     fl    = floor exact
+                 in (p, fl, exact - intToDecimal fl, c)
+               | (p, c) <- commits ]
+             allocated = sum [ fl | (_, fl, _, _) <- raw ]
+             residual  = totalCents - allocated            -- cents still to hand out (0 .. n-1)
+             -- largest-remainder ranking: biggest fractional remainder first,
+             -- then biggest commitment, then party (fully deterministic)
+             ranked = sortOn (\(p, _, frac, c) -> (negate frac, negate c, p)) raw
+             n      = length ranked
+             final  =
+               [ (p, dollarsOf (fl + (if i < residual then 1 else 0)))
+               | (i, (p, fl, _, _)) <- zip [0 .. n - 1] ranked ]
+         in final

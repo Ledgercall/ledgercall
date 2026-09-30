@@ -1,0 +1,53 @@
+-- | The fund and per-LP commitments.
+module LedgerCall.Fund where
+
+-- | A private fund. Signed by the GP; the administrator observes. LPs are not
+-- stakeholders of the Fund contract; each LP only ever sees its own Commitment.
+template Fund
+  with
+    gp              : Party
+    admin           : Party
+    fundId          : Text
+    name            : Text
+    instrumentAdmin : Party   -- ^ the cash instrument's admin party (e.g. Canton Coin on LocalNet)
+    instrumentId    : Text    -- ^ the cash instrument identifier
+  where
+    signatory gp
+    observer admin
+    ensure fundId /= "" && name /= ""
+
+-- | A per-LP commitment. Signed by gp and lp; the administrator observes. One LP is not
+-- a stakeholder of another's Commitment, so it cannot see it. `committed - drawn` is the
+-- LP's uncalled capital, which caps how much it can absorb in the dilution waterfall.
+template Commitment
+  with
+    gp        : Party
+    admin     : Party
+    lp        : Party
+    fundId    : Text
+    committed : Decimal   -- ^ total committed (not funded up front)
+    drawn     : Decimal   -- ^ funded so far
+    inDefault : Bool      -- ^ set by the GP, not automatically
+  where
+    signatory gp, lp
+    observer admin
+    ensure committed > 0.0 && drawn >= 0.0 && drawn <= committed
+
+    -- | Uncalled capital available to this LP.
+    nonconsuming choice Commitment_Uncalled : Decimal
+      controller gp
+      do pure (committed - drawn)
+
+    -- | Record that `drawAmount` of this commitment has been funded (raises `drawn`).
+    choice Commitment_RecordDraw : ContractId Commitment
+      with drawAmount : Decimal
+      controller gp
+      do
+        assertMsg "draw must be positive" (drawAmount > 0.0)
+        assertMsg "draw within uncalled capital" (drawn + drawAmount <= committed)
+        create this with drawn = drawn + drawAmount
+
+    -- | GP flags this LP as in default. A GP decision, not a timer.
+    choice Commitment_DeclareDefault : ContractId Commitment
+      controller gp
+      do create this with inDefault = True
