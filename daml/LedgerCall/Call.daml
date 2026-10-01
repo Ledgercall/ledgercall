@@ -1,0 +1,69 @@
+-- | The capital call and the per-LP obligation fan-out.
+--
+-- The aggregate `CapitalCall` is not observed by LPs, so the investor roster never
+-- leaks. Each LP learns the call total and its own share through its own
+-- `CallObligation`, which matches market practice: an LP sees the total and its share,
+-- not the investor list.
+module LedgerCall.Call where
+
+-- | Lifecycle of the whole call.
+data CallStatus = CallOpen | CallSettled | CallFailed | CallCancelled
+  deriving (Eq, Show)
+
+-- | Lifecycle of one LP's obligation within a call.
+data ObligationStatus = ObPending | ObAllocated | ObSettled | ObReleased | ObDefaulted
+  deriving (Eq, Show)
+
+-- | The aggregate capital call. Signed by gp; admin observes; LPs do not.
+-- `executors` is fixed at creation: changing the executor set would require every
+-- allocation to be cancelled and re-made.
+template CapitalCall
+  with
+    gp             : Party
+    admin          : Party
+    fundId         : Text
+    callId         : Text
+    totalAmount    : Decimal
+    purpose        : Text
+    noticeTime     : Time
+    allocateBefore : Time
+    settleBefore   : Time
+    executors      : [Party]
+    status         : CallStatus
+  where
+    signatory gp
+    observer admin
+    ensure totalAmount > 0.0 && allocateBefore < settleBefore
+
+    -- | Record the outcome of the call (Settled / Failed / Cancelled).
+    choice CapitalCall_Close : ContractId CapitalCall
+      with outcome : CallStatus
+      controller gp
+      do create this with status = outcome
+
+-- | One obligation per LP. Signed by gp; observed by lp and admin. An LP observes only
+-- its own obligation, so it reads `callTotal` and its own `amountDue` but no other LP's
+-- figure. Covered by testLpCannotSeeOtherLp and the PQS blindness proof.
+template CallObligation
+  with
+    gp             : Party
+    admin          : Party
+    lp             : Party
+    fundId         : Text
+    callId         : Text
+    callTotal      : Decimal          -- ^ call total (disclosed to each LP)
+    amountDue      : Decimal          -- ^ this LP's pro-rata share
+    allocateBefore : Time
+    settleBefore   : Time
+    executors      : [Party]
+    status         : ObligationStatus
+  where
+    signatory gp
+    observer lp, admin
+    ensure amountDue >= 0.0
+
+    -- | Advance this obligation's status (Allocated / Settled / Released / Defaulted).
+    choice CallObligation_SetStatus : ContractId CallObligation
+      with newStatus : ObligationStatus
+      controller gp
+      do create this with status = newStatus
