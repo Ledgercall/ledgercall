@@ -1,0 +1,153 @@
+-- | The dilution waterfall.
+--
+-- When an LP fails to fund, the GP may re-allocate the shortfall across the
+-- non-defaulting LPs, pro-rata and capped by each LP's uncalled capital, iterating when
+-- a cap binds. The arithmetic is automated; the decision to run it stays with the GP,
+-- since GP discretion over default remedies is a deliberate control in practice.
+module LedgerCall.Cascade where
+
+import DA.List (sortOn)
+import LedgerCall.Util (centsOf, dollarsOf)
+
+-- One eligible (non-defaulting) LP's input to the waterfall.
+data RecutInput = RecutInput with
+    lp       : Party
+    weight   : Decimal   -- ^ pro-rata weight = the LP's commitment K_i
+    capacity : Decimal   -- ^ max additional it can absorb = uncalled_i - its own share A_i (>= 0)
+  deriving (Eq, Show, Ord)
+
+-- Result of the waterfall.
+data RecutResult = RecutResult with
+    extras   : [(Party, Decimal)]   -- ^ additional amount per LP that took some (extra > 0)
+    unfunded : Decimal              -- ^ residual that could not be re-allocated
+  deriving (Eq, Show)
+
+-- internal working item: (lp, weightCents, capCents, takenCents)
+type Item = (Party, Int, Int, Int)
+
+-- | Pure dilution waterfall: pro-rata, capped by uncalled capital, iterating when a cap
+-- binds, with a loop guard and an unfunded residual.
+--
+-- Invariant (exact, in integer cents): shortfall == sum extras + unfunded
+computeRecut : Decimal -> [RecutInput] -> RecutResult
+computeRecut shortfall inputs =
+  let items0        = [ (ri.lp, centsOf ri.weight, centsOf ri.capacity, 0) | ri <- inputs ]
+      fuel          = length inputs * 2 + 4
+      (final, rem)  = runRounds (centsOf shortfall) items0 fuel
+      extras        = [ (p, dollarsOf tk) | (p, _, _, tk) <- final, tk > 0 ]
+  in RecutResult with extras; unfunded = dollarsOf (max 0 rem)
+
+-- Proportional rounds. Each round distributes `remaining` across still-eligible LPs
+-- pro-rata by weight (floored), capped by remaining room. When flooring stalls
+-- progress, finish deterministically by unit drip.
+runRounds : Int -> [Item] -> Int -> ([Item], Int)
+runRounds remaining items fuel
+  | remaining <= 0 = (items, 0)
+  | fuel <= 0      = (items, remaining)                    -- guard against an infinite loop
+  | otherwise =
+      let base = sum [ w | (_, w, cap, tk) <- items, tk < cap ]   -- weight of eligible LPs
+      in if base <= 0
+           then dripAll remaining items                    -- no weighted eligible left
+           else
+             let res    = map (stepItem remaining base) items
+                 items' = map fst res
+                 took   = sum (map snd res)
+             in if took <= 0
+                  then dripAll remaining items             -- flooring stalled → finish by drip
+                  else runRounds (remaining - took) items' (fuel - 1)
+
+-- One LP's proportional take this round (floored, capped by room).
+stepItem : Int -> Int -> Item -> (Item, Int)
+stepItem remaining base (p, w, cap, tk) =
+  let room = cap - tk
+  in if room <= 0
+       then ((p, w, cap, tk), 0)
+       else
+         let want = (remaining * w) / base
+             take = min want room
+         in ((p, w, cap, tk + take), take)
+
+-- Distribute the remaining cents one at a time to LPs that still have room, ordered by
+-- weight desc then party (deterministic). Terminates via fuel.
+dripAll : Int -> [Item] -> ([Item], Int)
+dripAll remaining items =
+  let ordered = sortOn (\(p, w, _, _) -> (negate w, p)) items
+  in dripGo remaining ordered (length items + remaining + 1)
+
+dripGo : Int -> [Item] -> Int -> ([Item], Int)
+dripGo remaining items fuel
+  | remaining <= 0 = (items, 0)
+  | fuel <= 0      = (items, remaining)
+  | otherwise =
+      let (items', moved) = onePass remaining items
+      in if moved <= 0
+           then (items', remaining)                        -- no room left anywhere
+           else dripGo (remaining - moved) items' (fuel - 1)
+
+-- Give at most one cent to each LP with room, left to right, limited by `remaining`.
+onePass : Int -> [Item] -> ([Item], Int)
+onePass _ [] = ([], 0)
+onePass remaining ((p, w, cap, tk) :: rest)
+  | remaining <= 0 = ((p, w, cap, tk) :: rest, 0)
+  | cap - tk > 0 =
+      let (rest', movedRest) = onePass (remaining - 1) rest
+      in ((p, w, cap, tk + 1) :: rest', movedRest + 1)
+  | otherwise =
+      let (rest', movedRest) = onePass remaining rest
+      in ((p, w, cap, tk) :: rest', movedRest)
+
+-- Templates -----------------------------------------------------------------
+
+-- | The administrator computes the recut and proposes it; the GP decides. Signed by
+-- admin; observed by gp. `defaulters` lives here only and is never observable by an LP.
+template ShortfallProposal
+  with
+    admin      : Party
+    gp         : Party
+    fundId     : Text
+    callId     : Text
+    shortfall  : Decimal
+    defaulters : [Party]              -- ^ gp + admin only; never observed by any LP
+    recuts     : [(Party, Decimal)]   -- ^ (lp, extraDue)
+    unfunded   : Decimal              -- ^ residual not coverable by dilution
+  where
+    signatory admin
+    observer gp
+    ensure shortfall >= 0.0
+
+    -- | The GP runs the recut. Creates one RecutObligation per non-defaulting LP,
+    -- each visible only to that LP.
+    choice ApproveRecut : [ContractId RecutObligation]
+      with baseShares : [(Party, Decimal)]   -- ^ (lp, original amountDue) for newTotal
+      controller gp
+      do
+        let baseOf p = optional 0.0 identity (lookup p baseShares)
+        forA recuts $ \(lp, extraDue) ->
+          create RecutObligation with
+            gp; admin; fundId; callId; lp
+            extraDue
+            newTotal = baseOf lp + extraDue
+
+    -- | GP declines the recut (e.g. the cause is a bank delay, not a default).
+    -- Leaves every LP's position untouched.
+    choice DeclineRecut : ()
+      with reason : Text
+      controller gp
+      do pure ()
+
+-- | One LP's additional obligation after an approved recut. No `defaulters` field: the
+-- LP learns its own figure, not who defaulted or how many did. Covered by
+-- testLpCannotSeeOtherLp.
+template RecutObligation
+  with
+    gp       : Party
+    admin    : Party
+    lp       : Party
+    fundId   : Text
+    callId   : Text
+    extraDue : Decimal    -- ^ this LP's additional amount
+    newTotal : Decimal    -- ^ its original share + extraDue
+  where
+    signatory gp
+    observer lp, admin
+    ensure extraDue >= 0.0
