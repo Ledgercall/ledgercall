@@ -1,0 +1,70 @@
+-- | The venue's implementation of the Canton Token Standard (CIP-0056).
+--
+-- This module imports only the standard interfaces, no registry-specific code, so the
+-- venue can settle a call against cash held in any CIP-0056 registry.
+--
+-- One `AllocationRequest` per LP, each carrying exactly one leg. A single request
+-- holding all N legs would make every LP an observer of every other LP's amount
+-- (senders are observers of the request), which would break per-LP privacy.
+module LedgerCall.Allocation where
+
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.AllocationRequestV1
+
+-- | Build the SettlementInfo shared by a call's legs. `executor` (the GP) settles;
+-- the deadlines come straight from the call (auto-release after `allocateBefore`).
+mkSettlement : Party -> Text -> Time -> Time -> Time -> SettlementInfo
+mkSettlement executor callId requestedAt allocateBefore settleBefore =
+  SettlementInfo with
+    executor
+    settlementRef = Reference with id = callId; cid = None
+    requestedAt
+    allocateBefore
+    settleBefore
+    meta = emptyMetadata
+
+-- | One LP's single transfer leg: the LP sends `amount` of the cash instrument to
+-- the fund (receiver).
+mkLeg : Party -> Party -> Decimal -> InstrumentId -> TransferLeg
+mkLeg sender receiver amount instrumentId =
+  TransferLeg with sender; receiver; amount; instrumentId; meta = emptyMetadata
+
+-- | One LP's request to allocate its share of a call. Signed by gp; observed by lp and
+-- admin. Implements the standard `AllocationRequest`, so a standards-compliant wallet
+-- can render it and the LP can allocate against its own registry.
+template CallAllocationRequest
+  with
+    gp             : Party
+    admin          : Party
+    lp             : Party
+    callId         : Text
+    legId          : Text
+    executor       : Party          -- ^ the GP, who submits the settlement
+    receiver       : Party          -- ^ the fund/GP, which receives the cash
+    amount         : Decimal        -- ^ THIS LP's amountDue
+    instrumentId   : InstrumentId   -- ^ the cash instrument (e.g. Canton Coin)
+    requestedAt    : Time
+    allocateBefore : Time
+    settleBefore   : Time
+  where
+    signatory gp
+    observer lp, admin
+    ensure amount > 0.0 && allocateBefore < settleBefore
+
+    interface instance AllocationRequest for CallAllocationRequest where
+      view = AllocationRequestView with
+        settlement = mkSettlement executor callId requestedAt allocateBefore settleBefore
+        -- exactly one leg per LP (keeps each LP's amount private)
+        transferLegs = TextMap.fromList [(legId, mkLeg lp receiver amount instrumentId)]
+        meta = emptyMetadata
+
+      allocationRequest_RejectImpl _self arg = do
+        assertMsg "only the sending LP may reject its own request" (arg.actor == lp)
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+      allocationRequest_WithdrawImpl _self _arg =
+        pure ChoiceExecutionMetadata with meta = emptyMetadata

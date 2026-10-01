@@ -1,0 +1,58 @@
+-- | Atomic settlement.
+--
+-- Every leg executes inside one Daml transaction, and Canton requires confirmation from
+-- every signatory's participant, so the call cannot half-settle. All-or-nothing comes
+-- from the ledger, not application code.
+--
+-- Authority: `Allocation_ExecuteTransfer` is controlled by [executor, sender, receiver].
+-- For the GP to execute every LP's leg, the settlement contract must carry the LPs'
+-- authority, so `CallSettlement` is co-signed by the GP and all allocating LPs (the same
+-- pattern the reference OTCTrade uses).
+module LedgerCall.Settlement where
+
+import DA.Foldable (forA_)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV1
+
+import LedgerCall.Fund (Commitment, Commitment_RecordDraw (..))
+
+-- | Empty extra-args for registries (like our test registry) that need no
+-- off-ledger choice context. A production registry supplies disclosures + context.
+emptyExtraArgs : ExtraArgs
+emptyExtraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+-- | One leg of the settlement: the LP's funded allocation, its commitment, and
+-- the amount to draw down.
+data SettleLeg = SettleLeg with
+    allocationCid : ContractId Allocation
+    commitmentCid : ContractId Commitment
+    drawAmount    : Decimal
+  deriving (Eq, Show)
+
+-- | The all-or-nothing settlement, co-signed by the GP and all allocating LPs.
+template CallSettlement
+  with
+    gp       : Party
+    admin    : Party
+    lps      : [Party]
+    callId   : Text
+    expected : Decimal
+  where
+    signatory gp, lps
+    observer admin
+    ensure expected >= 0.0
+
+    -- | Execute every leg in one transaction. If any leg fails (a missing or released
+    -- allocation, an over-draw), the whole transaction aborts and nothing moves.
+    choice SettleAll : ()
+      with
+        legs : [SettleLeg]
+      controller gp
+      do
+        forA_ legs $ \leg -> do
+          -- move the LP's locked cash to the fund (standard interface choice)
+          _ <- exercise leg.allocationCid (Allocation_ExecuteTransfer with extraArgs = emptyExtraArgs)
+          -- record the draw against the commitment
+          _ <- exercise leg.commitmentCid (Commitment_RecordDraw with drawAmount = leg.drawAmount)
+          pure ()
