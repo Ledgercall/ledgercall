@@ -1,0 +1,146 @@
+-- | Seeds the demo state on a running LocalNet for the PQS blindness proof and the
+-- live allocation/settlement flow.
+--
+-- Parties are pre-allocated across two participants by scripts/seed-localnet.sh
+-- (gp/admin/most-LPs on app-provider, one isolated LP alone on app-user), and the
+-- acting user is granted CanActAs for them. This script takes those party IDs as input
+-- and creates the call, the per-LP obligations, the shortfall proposal, and a cash
+-- holding for each app-provider LP so they can allocate from the UI.
+--
+-- Run with:  dpm script --script-name LedgerCall.LocalNetSeed:seedFromInput
+--            --input-file input.json --participant-config participants.json
+--            --access-token-file token.jwt --user-id ledger-api-user
+module LedgerCall.LocalNetSeed where
+
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 (InstrumentId (..))
+import Splice.Api.Token.AllocationV1 (Allocation, Allocation_ExecuteTransfer (..), Allocation_Withdraw (..))
+
+import LedgerCall.Allocation (mkSettlement)
+import LedgerCall.Call
+import LedgerCall.Cascade
+import LedgerCall.Settlement (emptyExtraArgs)
+import LedgerCall.TestRegistry (LedgerCallCash (..), LedgerCallCashAllocation (..), Cash_Allocate (..))
+import LedgerCall.Util (proRata)
+
+-- No-op, used as a vehicle for `dpm script --upload-dar` to push the DAR to a participant.
+noop : Script ()
+noop = pure ()
+
+-- Pre-allocated parties fed in via --input-file.
+data SeedInput = SeedInput with
+    gp       : Party
+    admin    : Party
+    registry : Party   -- ^ the (test) cash instrument admin, on app-provider
+    lps      : [Party]  -- ^ LPs hosted on app-provider (same node as the GP)
+    isoLp    : Party    -- ^ the one LP hosted alone on app-user (the isolated viewport)
+  deriving (Eq, Show)
+
+usdOf : Party -> InstrumentId
+usdOf registry = InstrumentId with admin = registry; id = "USD"
+
+seedFromInput : SeedInput -> Script ()
+seedFromInput inp = do
+  -- idempotent: archive any prior demo contracts so re-seeding yields a clean state
+  cleanup inp
+  let allLps    = inp.lps <> [inp.isoLp]
+      committed = 5000000.0                               -- each LP committed $5m (uncalled capital to dilute into)
+      total     = 3000000.0                               -- a $3m call => $500k per LP across 6 LPs
+      commits   = map (\lp -> (lp, committed)) allLps
+      shares    = proRata total commits
+      shareOf p = optional 0.0 identity (lookup p shares)
+  now <- getTime
+  let ab = addRelTime now (days 10)
+      sb = addRelTime now (days 12)
+
+  -- the aggregate call, visible to the GP only (LPs are not observers)
+  _ <- submit inp.gp $ createCmd CapitalCall with
+         gp = inp.gp; admin = inp.admin; fundId = "FUND-1"; callId = "CALL-1"
+         totalAmount = total; purpose = "Portfolio acquisition"; noticeTime = now
+         allocateBefore = ab; settleBefore = sb; executors = [inp.gp]; status = CallOpen
+
+  -- one private obligation per LP (observed only by that LP + admin)
+  forA_ allLps $ \lp ->
+    submit inp.gp $ createCmd CallObligation with
+      gp = inp.gp; admin = inp.admin; lp; fundId = "FUND-1"; callId = "CALL-1"
+      callTotal = total; amountDue = shareOf lp
+      allocateBefore = ab; settleBefore = sb; executors = [inp.gp]; status = ObPending
+
+  -- real cash for each app-provider LP so the "no wires" allocation is drivable live.
+  -- (The isolated LP is the defaulter; it never funds, so it gets no cash.)
+  forA_ inp.lps $ \lp ->
+    submitMulti [inp.registry, lp] [] $ createCmd LedgerCallCash with
+      registry = inp.registry; owner = lp; amount = 1000000.0; instrumentId = usdOf inp.registry
+
+  -- the isolated LP defaults; the admin proposes the dilution recut across the rest.
+  -- The proposal carries the defaulter's identity and is visible only to gp + admin.
+  let eligible = [ RecutInput lp committed (committed - shareOf lp) | lp <- inp.lps ]
+      recut    = computeRecut (shareOf inp.isoLp) eligible
+  _ <- submit inp.admin $ createCmd ShortfallProposal with
+         admin = inp.admin; gp = inp.gp; fundId = "FUND-1"; callId = "CALL-1"
+         shortfall = shareOf inp.isoLp; defaulters = [inp.isoLp]
+         recuts = recut.extras; unfunded = recut.unfunded
+  pure ()
+
+-- Archive any prior demo contracts so a re-seed starts clean. gp signs the
+-- call/obligations/recuts; admin the proposal; registry+owner the cash/allocations.
+cleanup : SeedInput -> Script ()
+cleanup inp = do
+  os <- query @CallObligation inp.gp
+  forA_ os $ \(cid, _) -> submit inp.gp $ archiveCmd cid
+  cs <- query @CapitalCall inp.gp
+  forA_ cs $ \(cid, _) -> submit inp.gp $ archiveCmd cid
+  rs <- query @RecutObligation inp.gp
+  forA_ rs $ \(cid, _) -> submit inp.gp $ archiveCmd cid
+  ps <- query @ShortfallProposal inp.admin
+  forA_ ps $ \(cid, _) -> submit inp.admin $ archiveCmd cid
+  allocs <- query @LedgerCallCashAllocation inp.registry
+  forA_ allocs $ \(cid, a) -> submitMulti [inp.registry, a.owner] [] $ archiveCmd cid
+  cash <- query @LedgerCallCash inp.registry
+  forA_ cash $ \(cid, c) -> submitMulti [inp.registry, c.owner] [] $ archiveCmd cid
+
+-- Each app-provider LP locks its share from its own registry holding (the "no wires"
+-- action), producing a real token-standard Allocation. Independent per LP.
+allocateAll : SeedInput -> Script ()
+allocateAll inp = do
+  obls   <- query @CallObligation inp.gp
+  cashes <- query @LedgerCallCash inp.registry
+  now    <- getTime
+  forA_ inp.lps $ \lp ->
+    case ( [ o | (_, o) <- obls, o.lp == lp ]
+         , [ (cid, c) | (cid, c) <- cashes, c.owner == lp, c.amount > 0.0 ] ) of
+      (o :: _, (cashCid, _) :: _) -> do
+        _ <- submit lp $ exerciseCmd cashCid Cash_Allocate with
+               executor = inp.gp; receiver = inp.gp
+               settlement = mkSettlement inp.gp o.callId now o.allocateBefore o.settleBefore
+               transferLegId = o.callId <> "-" <> partyToText lp
+               allocAmount = o.amountDue
+        pure ()
+      _ -> pure ()
+
+-- Atomic settlement: every funded allocation executes inside one transaction. The GP
+-- submits it together with the allocating LPs, so Canton requires confirmation from
+-- every signatory's participant. If any single leg fails, the whole transaction aborts
+-- and nothing moves. All-or-nothing comes from the ledger, not application code.
+settleAll : SeedInput -> Script ()
+settleAll inp = do
+  allocs <- query @LedgerCallCashAllocation inp.registry
+  let owners = [ a.owner | (_, a) <- allocs ]
+      cids   = [ toInterfaceContractId @Allocation cid | (cid, _) <- allocs ]
+  if null cids
+    then pure ()
+    else do
+      _ <- submitMulti (inp.gp :: owners) [] $
+             mapA (\c -> exerciseCmd c (Allocation_ExecuteTransfer with extraArgs = emptyExtraArgs)) cids
+      pure ()
+
+-- After the deadline, each sender releases its allocation and the holding returns to it.
+releaseAll : SeedInput -> Script ()
+releaseAll inp = do
+  allocs <- query @LedgerCallCashAllocation inp.registry
+  forA_ allocs $ \(cid, a) ->
+    submit a.owner $ exerciseCmd (toInterfaceContractId @Allocation cid)
+      (Allocation_Withdraw with extraArgs = emptyExtraArgs)
