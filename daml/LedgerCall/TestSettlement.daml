@@ -1,0 +1,150 @@
+-- | Settlement tests.
+--
+--   testHappyPath            : N LPs allocate, one transaction settles every leg,
+--                              and every commitment's `drawn` increases.
+--   testOneShortNothingMoves : N-1 allocate, one does not; the atomic settle of the
+--                              full call aborts, the deadline releases every lock,
+--                              and no cash moves.
+--
+-- These run the token-standard interfaces against the test registry
+-- (LedgerCall.TestRegistry). On LocalNet the same venue settles Canton Coin.
+module LedgerCall.TestSettlement where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 (InstrumentId (..))
+import Splice.Api.Token.AllocationV1 (Allocation, Allocation_Withdraw (..))
+
+import LedgerCall.Fund (Commitment)
+import LedgerCall.Allocation (CallAllocationRequest (..), mkSettlement)
+import LedgerCall.Settlement
+import LedgerCall.TestRegistry
+import LedgerCall.Test (Fixture (..), setup, mkCommitment)
+
+-- Total holdings of `owner` in `instrumentId`, read from the registry's full view.
+cashBalance : Party -> InstrumentId -> Party -> Script Decimal
+cashBalance registry instrumentId owner = do
+  cs <- query @LedgerCallCash registry
+  pure $ sum [ c.amount | (_, c) <- cs, c.owner == owner, c.instrumentId == instrumentId ]
+
+-- 2 · Happy path: everyone allocates, one atomic settlement moves every leg -------
+testHappyPath : Script ()
+testHappyPath = do
+  registry <- allocateParty "Registry"
+  f <- setup 3
+  let gp = f.gp; admin = f.admin; lps = f.lps
+      instrumentId = InstrumentId with admin = registry; id = "CC"
+  now <- getTime
+  let ab = addRelTime now (days 10)
+      sb = addRelTime now (days 12)
+      total = 90.0
+
+  -- fund each LP with 1000 of cash in the (test) registry
+  forA_ lps $ \lp ->
+    submitMulti [registry, lp] [] $ createCmd LedgerCallCash with
+      registry; owner = lp; amount = 1000.0; instrumentId
+
+  -- each LP commits 100 -> equal pro-rata -> 30 each of a 90 call
+  comCids <- mapA (\lp -> mkCommitment gp admin lp 100.0) lps
+
+  legs <- forA (zip (zip lps comCids) [0 .. length lps - 1]) $ \((lp, comCid), i) -> do
+    let amt   = 30.0
+        legId = "leg" <> show i
+    -- venue publishes the private per-LP allocation request (gp signs; lp observes)
+    _ <- submit gp $ createCmd CallAllocationRequest with
+           gp; admin; lp; callId = "CALL-1"; legId
+           executor = gp; receiver = gp; amount = amt; instrumentId
+           requestedAt = now; allocateBefore = ab; settleBefore = sb
+    -- the LP allocates from its own registry holding (locks the funds)
+    (cashCid, _) :: _ <- filter (\(_, c) -> c.owner == lp) <$> query @LedgerCallCash lp
+    allocCid <- submit lp $ exerciseCmd cashCid Cash_Allocate with
+      executor = gp; receiver = gp
+      settlement = mkSettlement gp "CALL-1" now ab sb
+      transferLegId = legId; allocAmount = amt
+    pure SettleLeg with allocationCid = allocCid; commitmentCid = comCid; drawAmount = amt
+
+  -- the co-signed settlement, then the GP fires one transaction that settles all legs
+  settlementCid <- submitMulti (gp :: lps) [] $ createCmd CallSettlement with
+    gp; admin; lps; callId = "CALL-1"; expected = total
+  submit gp $ exerciseCmd settlementCid SettleAll with legs
+
+  -- the fund received the whole call; each LP is down exactly its share
+  gpBal <- cashBalance registry instrumentId gp
+  gpBal === total
+  forA_ lps $ \lp -> do
+    b <- cashBalance registry instrumentId lp
+    b === 970.0
+  -- and every commitment's drawn rose by the drawn amount, atomically with the cash
+  coms <- query @Commitment gp
+  forA_ coms $ \(_, c) -> c.drawn === 30.0
+
+-- 3 · One LP short: the settle aborts, the deadline releases, nothing moves -------
+testOneShortNothingMoves : Script ()
+testOneShortNothingMoves = do
+  registry <- allocateParty "Registry"
+  f <- setup 3
+  let gp = f.gp; admin = f.admin
+      [lp1, lp2, lp3] = f.lps
+      lps = f.lps
+      instrumentId = InstrumentId with admin = registry; id = "CC"
+  now <- getTime
+  let ab = addRelTime now (days 10)
+      sb = addRelTime now (days 12)
+
+  forA_ lps $ \lp ->
+    submitMulti [registry, lp] [] $ createCmd LedgerCallCash with
+      registry; owner = lp; amount = 1000.0; instrumentId
+
+  -- lp1 and lp2 allocate 30 each; lp3 never funds its leg
+  let allocatorsPart = [lp1, lp2]
+  alive <- forA (zip allocatorsPart [0 .. length allocatorsPart - 1]) $ \(lp, i) -> do
+    (cashCid, _) :: _ <- filter (\(_, c) -> c.owner == lp) <$> query @LedgerCallCash lp
+    ac <- submit lp $ exerciseCmd cashCid Cash_Allocate with
+      executor = gp; receiver = gp
+      settlement = mkSettlement gp "CALL-1" now ab sb
+      transferLegId = "leg" <> show i; allocAmount = 30.0
+    pure (lp, ac)
+
+  -- lp3 allocates then withdraws, leaving a released (dead) allocation cid
+  (cash3, _) :: _ <- filter (\(_, c) -> c.owner == lp3) <$> query @LedgerCallCash lp3
+  deadAc <- submit lp3 $ exerciseCmd cash3 Cash_Allocate with
+    executor = gp; receiver = gp
+    settlement = mkSettlement gp "CALL-1" now ab sb
+    transferLegId = "leg2"; allocAmount = 30.0
+  submit lp3 $ exerciseCmd deadAc (Allocation_Withdraw with extraArgs = emptyExtraArgs)
+
+  -- commitments, so a settlement could in principle be attempted
+  comCids <- mapA (\lp -> mkCommitment gp admin lp 100.0) lps
+  settlementCid <- submitMulti (gp :: lps) [] $ createCmd CallSettlement with
+    gp; admin; lps; callId = "CALL-1"; expected = 90.0
+
+  -- settling the full call in one tx aborts, because lp3's leg is dead
+  let [c1, c2, c3] = comCids
+      [(_, ac1), (_, ac2)] = alive
+      allLegs =
+        [ SettleLeg ac1    c1 30.0
+        , SettleLeg ac2    c2 30.0
+        , SettleLeg deadAc c3 30.0 ]
+  submitMultiMustFail (gp :: lps) [] $ exerciseCmd settlementCid SettleAll with legs = allLegs
+
+  -- nothing settled: the fund is still empty and lp1/lp2 are still only locked
+  gpMid <- cashBalance registry instrumentId gp
+  gpMid === 0.0
+
+  -- the deadline passes; the live locks release back to their owners
+  passTime (days 13)
+  forA_ alive $ \(lp, ac) ->
+    submit lp $ exerciseCmd ac (Allocation_Withdraw with extraArgs = emptyExtraArgs)
+
+  -- the fund got nothing and every LP is whole again
+  gpBal <- cashBalance registry instrumentId gp
+  gpBal === 0.0
+  forA_ lps $ \lp -> do
+    b <- cashBalance registry instrumentId lp
+    b === 1000.0
+  -- and no commitment was drawn
+  coms <- query @Commitment gp
+  forA_ coms $ \(_, c) -> c.drawn === 0.0

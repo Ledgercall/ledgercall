@@ -1,0 +1,195 @@
+-- | Test suite for the privacy and waterfall properties.
+--
+-- `testLpCannotSeeOtherLp` checks per-LP visibility: Daml Script's `query` respects the
+-- same signatory/observer rules as the ledger, so a 1-vs-0 count here is the same
+-- boundary shown across two PQS databases.
+--
+-- The allocate / atomic-settle / deadline-release tests are in LedgerCall.TestSettlement.
+module LedgerCall.Test where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import LedgerCall.Fund
+import LedgerCall.Call
+import LedgerCall.Cascade
+import LedgerCall.Util (proRata)
+
+-- Parties and a fund fixture -------------------------------------------------
+
+data Fixture = Fixture with
+    gp    : Party
+    admin : Party
+    lps   : [Party]
+
+setup : Int -> Script Fixture
+setup n = do
+  gp    <- allocateParty "Gp"
+  admin <- allocateParty "Admin"
+  lps   <- mapA (\i -> allocateParty ("LP" <> show i)) [1 .. n]
+  pure Fixture with gp; admin; lps
+
+mkCommitment : Party -> Party -> Party -> Decimal -> Script (ContractId Commitment)
+mkCommitment gp admin lp committed =
+  submitMulti [gp, lp] [] $ createCmd Commitment with
+    gp; admin; lp; fundId = "FUND-1"; committed; drawn = 0.0; inDefault = False
+
+-- 1 · Pro-rata sums to the total exactly, including the rounding residual --------
+testProRataSumsExactly : Script ()
+testProRataSumsExactly = do
+  f <- setup 7
+  -- weights sum to 100; call amount is deliberately awkward to force rounding
+  let commits = zip f.lps [10.0, 15.0, 15.0, 20.0, 12.5, 7.5, 20.0]
+      total   = 987.65
+      shares  = proRata total commits
+  -- shares sum back to the total exactly, to the cent
+  sum (map snd shares) === total
+  assertMsg "every share is non-negative" (all (\(_, a) -> a >= 0.0) shares)
+  assertMsg "one share per LP" (length shares == length f.lps)
+  -- a clean split with no residual also holds
+  let clean = proRata 100.0 (zip f.lps [10.0, 15.0, 15.0, 20.0, 12.5, 7.5, 20.0])
+  sum (map snd clean) === 100.0
+
+-- 2 · The waterfall caps an LP at its uncalled capital and iterates the rest ------
+testRecutIsCapped : Script ()
+testRecutIsCapped = do
+  f <- setup 2
+  let [a, b]    = f.lps
+      shortfall = 100.0
+      -- A can absorb at most 10 (small uncalled); B can absorb plenty.
+      inputs    = [ RecutInput a 50.0 10.0, RecutInput b 50.0 1000.0 ]
+      res       = computeRecut shortfall inputs
+      extraOf p = optional 0.0 identity (lookup p res.extras)
+  -- A is capped exactly at its capacity; B absorbs the remainder
+  extraOf a === 10.0
+  extraOf b === 90.0
+  res.unfunded === 0.0
+  -- the extras plus the unfunded residual account for the whole shortfall
+  (sum (map snd res.extras) + res.unfunded) === shortfall
+
+-- 2b · A call that stays under-funded after dilution is a valid outcome ----------
+testRecutCanUnderfund : Script ()
+testRecutCanUnderfund = do
+  f <- setup 2
+  let [a, b]    = f.lps
+      shortfall = 100.0
+      inputs    = [ RecutInput a 50.0 10.0, RecutInput b 50.0 20.0 ]  -- max cover = 30
+      res       = computeRecut shortfall inputs
+  res.unfunded === 70.0
+  (sum (map snd res.extras) + res.unfunded) === shortfall
+
+-- 3 · One LP cannot see another LP's obligation, call, or the shortfall proposal --
+testLpCannotSeeOtherLp : Script ()
+testLpCannotSeeOtherLp = do
+  f <- setup 3
+  let [lp1, lp2, lp3] = f.lps
+      gp    = f.gp
+      admin = f.admin
+  now <- getTime
+  let ab = addRelTime now (days 10)
+      sb = addRelTime now (days 12)
+
+  -- commitments (gp + each lp sign)
+  _ <- mkCommitment gp admin lp1 100.0
+  _ <- mkCommitment gp admin lp2 100.0
+  _ <- mkCommitment gp admin lp3 100.0
+
+  -- the aggregate call, visible to the GP only (LPs are not observers)
+  _ <- submit gp $ createCmd CapitalCall with
+         gp; admin; fundId = "FUND-1"; callId = "CALL-1"
+         totalAmount = 90.0; purpose = "Deal A"; noticeTime = now
+         allocateBefore = ab; settleBefore = sb; executors = [gp]; status = CallOpen
+
+  -- one private obligation per LP (30 each of a 90 call)
+  let mkObl lp = submit gp $ createCmd CallObligation with
+        gp; admin; lp; fundId = "FUND-1"; callId = "CALL-1"
+        callTotal = 90.0; amountDue = 30.0
+        allocateBefore = ab; settleBefore = sb; executors = [gp]; status = ObPending
+  _ <- mkObl lp1
+  _ <- mkObl lp2
+  _ <- mkObl lp3
+
+  -- admin proposes a recut; it carries the defaulter identity (lp3)
+  _ <- submit admin $ createCmd ShortfallProposal with
+         admin; gp; fundId = "FUND-1"; callId = "CALL-1"
+         shortfall = 30.0; defaulters = [lp3]
+         recuts = [(lp1, 15.0), (lp2, 15.0)]; unfunded = 0.0
+
+  -- visibility assertions: each LP sees only its own commitment and obligation
+  lp1Obls <- query @CallObligation lp1
+  length lp1Obls === 1
+  lp1Coms <- query @Commitment lp1
+  length lp1Coms === 1
+  -- LPs are not observers of the aggregate call
+  lp1Calls <- query @CapitalCall lp1
+  length lp1Calls === 0
+  -- no LP can see the shortfall proposal that names the defaulter
+  lp1Prop <- query @ShortfallProposal lp1
+  length lp1Prop === 0
+  lp2Prop <- query @ShortfallProposal lp2
+  length lp2Prop === 0
+  lp3Prop <- query @ShortfallProposal lp3
+  length lp3Prop === 0
+
+  -- the GP and admin see all three obligations and the proposal
+  gpObls <- query @CallObligation gp
+  length gpObls === 3
+  gpProp <- query @ShortfallProposal gp
+  length gpProp === 1
+  adminProp <- query @ShortfallProposal admin
+  length adminProp === 1
+  pure ()
+
+-- 4 · The GP can decline the recut and nothing changes --------------------------
+testGpCanDecline : Script ()
+testGpCanDecline = do
+  f <- setup 2
+  let [lp1, lp2] = f.lps
+      gp    = f.gp
+      admin = f.admin
+  _ <- mkCommitment gp admin lp1 100.0
+  _ <- mkCommitment gp admin lp2 100.0
+  propCid <- submit admin $ createCmd ShortfallProposal with
+    admin; gp; fundId = "FUND-1"; callId = "CALL-1"
+    shortfall = 20.0; defaulters = [lp2]
+    recuts = [(lp1, 20.0)]; unfunded = 0.0
+  -- GP declines the recut
+  submit gp $ exerciseCmd propCid DeclineRecut with reason = "bank delay, not a default"
+  -- no recut obligations exist for anyone
+  r1 <- query @RecutObligation lp1
+  length r1 === 0
+  -- commitments are untouched (still fully uncalled)
+  coms <- query @Commitment lp1
+  map (\(_, c) -> c.drawn) coms === [0.0]
+
+-- 5 · Approving the recut materialises one RecutObligation per LP, each private ---
+testApproveRecutIsPrivate : Script ()
+testApproveRecutIsPrivate = do
+  f <- setup 3
+  let [lp1, lp2, lp3] = f.lps
+      gp    = f.gp
+      admin = f.admin
+  _ <- mkCommitment gp admin lp1 100.0
+  _ <- mkCommitment gp admin lp2 100.0
+  _ <- mkCommitment gp admin lp3 100.0
+  propCid <- submit admin $ createCmd ShortfallProposal with
+    admin; gp; fundId = "FUND-1"; callId = "CALL-1"
+    shortfall = 30.0; defaulters = [lp3]
+    recuts = [(lp1, 15.0), (lp2, 15.0)]; unfunded = 0.0
+  -- GP approves. baseShares = each LP's original amountDue.
+  _ <- submit gp $ exerciseCmd propCid ApproveRecut with
+         baseShares = [(lp1, 30.0), (lp2, 30.0)]
+  -- lp1 sees exactly its own recut, and it totals base + extra = 45
+  r1 <- query @RecutObligation lp1
+  length r1 === 1
+  map (\(_, o) -> o.newTotal) r1 === [45.0]
+  -- lp1 cannot see lp2's recut
+  assertMsg "lp1 sees only its own recut" (all (\(_, o) -> o.lp == lp1) r1)
+  -- the defaulter (lp3) gets no recut obligation
+  r3 <- query @RecutObligation lp3
+  length r3 === 0
+  -- the GP sees all recuts it created
+  rgp <- query @RecutObligation gp
+  length rgp === 2
+  pure ()

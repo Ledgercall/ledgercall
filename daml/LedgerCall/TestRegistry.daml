@@ -1,0 +1,94 @@
+-- | A minimal implementation of the Canton Token Standard's `Holding` and `Allocation`
+-- interfaces, used to unit-test the settlement flow offline. It locks value and executes
+-- transfers through the real interfaces.
+--
+-- The venue code (LedgerCall.Allocation / .Settlement) never imports this module; it
+-- speaks only the standard interfaces. On LocalNet the same venue settles real Canton
+-- Coin instead (see scripts/demo-canton-coin.py).
+module LedgerCall.TestRegistry where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.AllocationV1
+
+-- | A unit of cash held by an owner in the (test) registry.
+template LedgerCallCash
+  with
+    registry     : Party
+    owner        : Party
+    amount       : Decimal
+    instrumentId : InstrumentId
+  where
+    signatory registry, owner
+    ensure amount > 0.0
+
+    interface instance Holding for LedgerCallCash where
+      view = HoldingView with
+        owner; instrumentId; amount; lock = None; meta = emptyMetadata
+
+    -- | Lock `allocAmount` into a standard `Allocation` for a settlement leg,
+    -- returning any change to the owner. (A production registry routes this via
+    -- `AllocationFactory_Allocate`; we model the lock directly for the test.)
+    choice Cash_Allocate : ContractId Allocation
+      with
+        executor      : Party
+        receiver      : Party
+        settlement    : SettlementInfo
+        transferLegId : Text
+        allocAmount   : Decimal
+      controller owner
+      do
+        assertMsg "positive allocation" (allocAmount > 0.0)
+        assertMsg "sufficient funds" (allocAmount <= amount)
+        -- return change to the owner, if any
+        let change = amount - allocAmount
+        if change > 0.0
+          then do
+            _ <- create this with amount = change
+            pure ()
+          else pure ()
+        allocCid <- create LedgerCallCashAllocation with
+          registry; owner; executor; receiver
+          amount = allocAmount; instrumentId; settlement; transferLegId
+        pure (toInterfaceContractId @Allocation allocCid)
+
+-- | A funded allocation: `amount` of the owner's cash locked to one settlement leg.
+template LedgerCallCashAllocation
+  with
+    registry      : Party
+    owner         : Party
+    executor      : Party
+    receiver      : Party
+    amount        : Decimal
+    instrumentId  : InstrumentId
+    settlement    : SettlementInfo
+    transferLegId : Text
+  where
+    signatory registry, owner
+    observer executor, receiver
+
+    interface instance Allocation for LedgerCallCashAllocation where
+      view = AllocationView with
+        allocation = AllocationSpecification with
+          settlement
+          transferLegId
+          transferLeg = TransferLeg with
+            sender = owner; receiver; amount; instrumentId; meta = emptyMetadata
+        holdingCids = []
+        meta = emptyMetadata
+
+      -- settle: deliver the locked cash to the receiver
+      allocation_executeTransferImpl _self _arg = do
+        _ <- create LedgerCallCash with registry; owner = receiver; amount; instrumentId
+        pure Allocation_ExecuteTransferResult with
+          senderHoldingCids = []; receiverHoldingCids = []; meta = emptyMetadata
+
+      -- cancel (executor/all parties): release the lock back to the owner
+      allocation_cancelImpl _self _arg = do
+        _ <- create LedgerCallCash with registry; owner; amount; instrumentId
+        pure Allocation_CancelResult with senderHoldingCids = []; meta = emptyMetadata
+
+      -- withdraw (sender): release the lock back to the owner (e.g. after deadline)
+      allocation_withdrawImpl _self _arg = do
+        _ <- create LedgerCallCash with registry; owner; amount; instrumentId
+        pure Allocation_WithdrawResult with senderHoldingCids = []; meta = emptyMetadata
