@@ -33,7 +33,7 @@ LocalNet must be up and seeded first (`scripts/setup-localnet.sh`, `scripts/seed
 ```bash
 cd frontend
 npm install
-npm run dev     # http://localhost:5173
+npm run dev     # landing page http://localhost:5173 · live demo http://localhost:5173/demo
 ```
 
 The Vite dev server proxies `/ap` → app-provider JSON API (3975) and `/au` → app-user

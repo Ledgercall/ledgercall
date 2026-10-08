@@ -77,5 +77,5 @@ bash "$ROOT/scripts/gen-frontend-config.sh"
 cat <<'EOF'
 >> up. next:
    scripts/privacy-proof.sh         # same SQL, two PQS DBs -> 6 vs 1
-   (cd frontend && npx vite)        # UI at http://localhost:5173
+   (cd frontend && npx vite)        # landing http://localhost:5173, live demo /demo
 EOF

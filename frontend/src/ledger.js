@@ -37,7 +37,39 @@ export async function activeFor(base, token, party) {
   return arr
     .map(e => e.contractEntry?.JsActiveContract?.createdEvent)
     .filter(Boolean)
-    .map(ce => ({ cid: ce.contractId, tpl: shortTemplate(ce.templateId), arg: ce.createArgument }))
+    .map(ce => ({ cid: ce.contractId, tpl: shortTemplate(ce.templateId), arg: ce.createArgument, offset: ce.offset }))
+}
+
+// A party's own transaction history after `beginExclusive`, read-only. Uses the
+// ledger-effects shape so exercised choices are named (e.g. Allocation_ExecuteTransfer).
+export async function historyFor(base, token, party, beginExclusive) {
+  const end = await ledgerEnd(base, token)
+  if (end <= beginExclusive) return []
+  const filtersByParty = { [party]: { cumulative: [{ identifierFilter: { WildcardFilter: { value: { includeCreatedEventBlob: false } } } }] } }
+  const body = {
+    beginExclusive,
+    endInclusive: end,
+    updateFormat: { includeTransactions: { eventFormat: { filtersByParty, verbose: false }, transactionShape: 'TRANSACTION_SHAPE_LEDGER_EFFECTS' } },
+  }
+  const r = await fetch(`${base}/v2/updates?limit=1000`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(`updates ${r.status}: ${await r.text()}`)
+  const arr = await r.json()
+  return arr
+    .map(u => u.update?.Transaction?.value)
+    .filter(Boolean)
+    .map(tx => ({
+      updateId: tx.updateId,
+      offset: tx.offset,
+      at: tx.effectiveAt,
+      events: tx.events.map(e => {
+        const [kind, v] = Object.entries(e)[0]
+        return { kind, cid: v.contractId, tpl: shortTemplate(v.templateId), choice: v.choice, arg: v.createArgument }
+      }),
+    }))
 }
 
 // Token-standard Allocation interface id and empty extra-args.

@@ -23,3 +23,6 @@ frontend/public/demo-config.json
 
 # NOTE: the four token-standard interface DARs under .lib/ ARE committed on purpose
 # so the project builds out of the box. Regenerate them with scripts/build-token-standard.sh.
+
+# UI review screenshots (local only; not committed)
+docs/ui/
